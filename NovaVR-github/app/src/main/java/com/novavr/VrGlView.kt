@@ -179,11 +179,24 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
     private var lastPoll = 0L; private var lastClock = 0L
     private var lastOvKey = ""
     private val texDims = HashMap<Int, Long>()
+    private val arRel = FloatArray(3)                            // andar real (ARCore)
+    private var pos0 = FloatArray(3); private var havePos0 = false
+    private var alphaAr = 0f; private var alphaInit = false
+    private var arInit = false; private var arGeoDirty = true; private var lastArStatus = ""
+    @Volatile var ar: ArTracker? = null
     @Volatile var vo: VoLite? = null                           // sentido do passo (frente/tras) pela camera
     @Volatile var walker: StepWalker? = null                   // andar por passos
     private var dirMode = 0                                    // 0 = automatico (camera), 1 = sempre frente, 2 = sempre tras
     private val voRel = FloatArray(3); private val voPend = FloatArray(3)
     private var prevF = floatArrayOf(0f, 0f, -1f)
+    private fun wrapA(x: Float): Float {
+        var v = x; val t2 = 2f * PI.toFloat()
+        while (v > PI.toFloat()) v -= t2
+        while (v < -PI.toFloat()) v += t2
+        return v
+    }
+    @Suppress("DEPRECATION")
+    private fun displayRotation(): Int = act.windowManager.defaultDisplay.rotation
     @Volatile private var tap = false
 
     // ---------- sensores ----------
@@ -433,7 +446,7 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
             RectF(40f, 810f, 960f, 880f), 26f)
         tp.textAlign = Paint.Align.LEFT; tp.textSize = 26f; tp.color = 0xFF9AA3BD.toInt()
         c.drawText("As janelas ficam fixas no mundo virtual.", 40f, 935f, tp)
-        c.drawText("Posicao: camera + giroscopio (passos virtuais)", 40f, 975f, tp)
+        c.drawText("Posicao: " + (ar?.status ?: "sem ARCore (andar por passos)"), 40f, 975f, tp)
         w.dirty = true
     }
 
@@ -456,7 +469,7 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
             id.startsWith("app:") -> appList.firstOrNull { it.id == id.substring(4) }?.let { load(it.url) }
             id == "kb" -> toggle(kb)
             id == "cfg" -> toggle(cfg)
-            id == "rc" -> { needCenter = true }
+            id == "rc" -> { needCenter = true; havePos0 = false }
             id == "mode" -> touchMode = !touchMode
             id == "hand" -> dominantRight = !dominantRight
             id == "diag" -> showDiag = !showDiag
@@ -924,7 +937,7 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
         strip.put(sv); strip.position(0)
         for (w in wins) { w.tex = 0; w.tTex = 0; w.dirty = true; w.tDirty = true }
         camTex = 0; lastCam = null; ovTex = 0; curTex = 0; curKey = -1; lastVer = -1; fbo = 0
-        texDims.clear(); lastOvKey = ""
+        texDims.clear(); arInit = false; lastOvKey = ""
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
@@ -934,6 +947,7 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {
         sw = w; sh = h
         buildFbo()
+        arGeoDirty = true
     }
 
     private fun buildFbo() {
@@ -1069,23 +1083,43 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
         if (now - lastClock > 30_000_000_000L) { lastClock = now; ui("dock") }
         updateHead()
 
+        val a = ar
+        if (a != null) {
+            if (!arInit) { a.initGl(); arInit = true; arGeoDirty = true }
+            if (arGeoDirty) { a.setDisplay(displayRotation(), sw, sh); arGeoDirty = false }
+            a.update()
+            if (a.status != lastArStatus) { lastArStatus = a.status; ui("cfg") }
+            if (a.tracking) {
+                if (abs(F[1]) < .7f) {                        // alinha o norte do ARCore com o do giroscopio
+                    val d = atan2(a.fwd[0], -a.fwd[2]) - atan2(F[0], -F[2])
+                    if (!alphaInit) { alphaAr = d; alphaInit = true } else alphaAr += wrapA(d - alphaAr) * .05f
+                }
+                if (!havePos0) { pos0 = a.pos.copyOf(); havePos0 = true }
+                val rx = a.pos[0] - pos0[0]; val ry = a.pos[1] - pos0[1]; val rz = a.pos[2] - pos0[2]
+                val ca = cos(alphaAr); val sa = sin(alphaAr)
+                val tx = rx * ca + rz * sa; val tz = -rx * sa + rz * ca
+                arRel[0] += (tx - arRel[0]) * .4f; arRel[1] += (ry - arRel[1]) * .4f; arRel[2] += (tz - arRel[2]) * .4f
+            }
+        }
         val angRate = if (dt > 0f) acos(dot(F, prevF).coerceIn(-1f, 1f)) / dt else 0f   // giro da cabeca (rad/s)
         prevF = floatArrayOf(F[0], F[1], F[2])
         val v = vo
         val wk = walker
         wk?.rotRate = angRate
         v?.setRate(angRate)
-        val fh = norm(floatArrayOf(F[0], 0f, F[2]))
-        val dCam = v?.take() ?: 0f
-        if (dCam != 0f && v != null && v.integrate) { voPend[0] += fh[0] * dCam; voPend[2] += fh[2] * dCam }
-        val n = wk?.takeSteps() ?: 0
-        if (wk != null && n > 0) {                                // deslocamento virtual por passos
-            val dsg = when (dirMode) { 1 -> 1f; 2 -> -1f; else -> (v?.dir() ?: 1).toFloat() }
-            voPend[0] += fh[0] * wk.stepLen * dsg * n; voPend[2] += fh[2] * wk.stepLen * dsg * n
+        if (ar?.tracking != true) {                               // com ARCore rastreando, ele cuida da posicao
+            val fh = norm(floatArrayOf(F[0], 0f, F[2]))
+            val dCam = v?.take() ?: 0f
+            if (dCam != 0f && v != null && v.integrate) { voPend[0] += fh[0] * dCam; voPend[2] += fh[2] * dCam }
+            val n = wk?.takeSteps() ?: 0
+            if (wk != null && n > 0) {                            // cada passo move voce; as janelas ficam paradas
+                val dsg = when (dirMode) { 1 -> 1f; 2 -> -1f; else -> (v?.dir() ?: 1).toFloat() }
+                voPend[0] += fh[0] * wk.stepLen * dsg * n; voPend[2] += fh[2] * wk.stepLen * dsg * n
+            }
         }
         val kk = minOf(1f, dt * 6f)                               // suaviza o movimento para nao enjoar
         for (i in 0..2) { val st = voPend[i] * kk; voRel[i] += st; voPend[i] -= st }
-        for (i in 0..2) head[i] = walkOff[i] + voRel[i]
+        for (i in 0..2) head[i] = walkOff[i] + arRel[i] + voRel[i]
 
         if (now - lastPoll > 30_000_000L) {                  // navegador: no maximo ~30 quadros/s
             lastPoll = now
