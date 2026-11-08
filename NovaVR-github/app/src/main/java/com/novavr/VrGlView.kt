@@ -1075,13 +1075,17 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
         val wk = walker
         wk?.rotRate = angRate
         v?.setRate(angRate)
-        val fh = norm(floatArrayOf(F[0], 0f, F[2]))
+        val flatHeading = norm(floatArrayOf(F[0], 0f, F[2]))
         val dCam = v?.take() ?: 0f
-        if (dCam != 0f && v != null && v.integrate) { voPend[0] += fh[0] * dCam; voPend[2] += fh[2] * dCam }
+        if (dCam != 0f && v != null && v.integrate) {
+            voPend[0] += flatHeading[0] * dCam
+            voPend[2] += flatHeading[2] * dCam
+        }
         val n = wk?.takeSteps() ?: 0
         if (wk != null && n > 0) {                                // cada passo move voce; as janelas ficam paradas
             val dsg = when (dirMode) { 1 -> 1f; 2 -> -1f; else -> (v?.dir() ?: 1).toFloat() }
-            voPend[0] += fh[0] * wk.stepLen * dsg * n; voPend[2] += fh[2] * wk.stepLen * dsg * n
+            voPend[0] += flatHeading[0] * wk.stepLen * dsg * n
+            voPend[2] += flatHeading[2] * wk.stepLen * dsg * n
         }
         val kk = minOf(1f, dt * 6f)                               // suaviza o movimento para nao enjoar
         for (i in 0..2) { val st = voPend[i] * kk; voRel[i] += st; voPend[i] -= st }
@@ -1092,17 +1096,30 @@ class VrGlView(private val act: Activity, private val browser: BrowserSurface, p
             val bf = browser.poll()
             if (bf != null && browser.version != lastVer) {
                 lastVer = browser.version; browserWin.bmp = bf
-                browserWin.uScale = browser.w.toFloat() / bf.width; browserWin.dirty = true
+                browserWin.uScale = browserWin.bw.toFloat() / bf.width.toFloat(); browserWin.dirty = true
             }
         }
         val cb = cam
-        val ew = fw / 2f; val eh = fh.toFloat()
+        val frameWidth: Float = fw / 2.0f
+        val frameHeight: Float = fh / 1.0f
+        val ew: Float = frameWidth
+        val eh: Float = frameHeight
         if (cb != null) {
-            cropS = max(ew / cb.width, eh / cb.height)
-            val srcW = ew / cropS; val srcH = eh / cropS
-            cropL = (cb.width - srcW) / 2f; cropT = (cb.height - srcH) / 2f
-            cu0 = cropL / cb.width; cv0 = cropT / cb.height; cus = srcW / cb.width; cvs = srcH / cb.height
-            if (cb !== lastCam) { camTex = up(camTex, cb); lastCam = cb }
+            val cameraWidth = cb.width.toFloat()
+            val cameraHeight = cb.height.toFloat()
+            cropS = max(ew / cameraWidth, eh / cameraHeight)
+            val srcW: Float = ew / cropS
+            val srcH: Float = eh / cropS
+            cropL = (cameraWidth - srcW) / 2f
+            cropT = (cameraHeight - srcH) / 2f
+            cu0 = cropL / cameraWidth
+            cv0 = cropT / cameraHeight
+            cus = srcW / cameraWidth
+            cvs = srcH / cameraHeight
+            if (cb !== lastCam) {
+                camTex = up(camTex, cb)
+                lastCam = cb
+            }
         }
 
         interact(dt)
